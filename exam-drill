@@ -1,0 +1,716 @@
+import React, { useState, useEffect, useRef } from "react";
+
+// ── Palette: exam-paper instrument, not a SaaS card kit ──────────────
+const C = {
+  paper: "#FBFAF6",
+  panel: "#FFFFFF",
+  ink: "#17242B",
+  inkSoft: "#516069",
+  rule: "#E4E7E0",
+  gridLine: "#EDEFEA",
+  pen: "#1B3B6F",
+  penSoft: "#5E7CA8",
+  amber: "#D9892B",
+  red: "#C0392B",
+  green: "#2E8B57",
+};
+
+const SERIF = "'Newsreader', Georgia, 'Times New Roman', serif";
+const MONO = "'IBM Plex Mono', ui-monospace, Menlo, monospace";
+const SANS = "system-ui, -apple-system, 'Segoe UI', sans-serif";
+
+const LOADING_LINES = [
+  "Reading your notes closely",
+  "Drafting exam-style questions",
+  "Setting the difficulty",
+  "Laying out the paper",
+];
+
+const GRADING_LINES = [
+  "Reading your answers",
+  "Checking against the key",
+  "Tallying the marks",
+];
+
+// ── Claude API helper ────────────────────────────────────────────────
+async function callClaude(system, userText) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1000,
+      system,
+      messages: [{ role: "user", content: userText }],
+    }),
+  });
+  if (!res.ok) throw new Error("Request failed (" + res.status + ")");
+  const data = await res.json();
+  return data.content
+    .map((i) => (i.type === "text" ? i.text : ""))
+    .filter(Boolean)
+    .join("\n");
+}
+
+function parseJSON(text) {
+  const clean = text.replace(/```json/g, "").replace(/```/g, "").trim();
+  const start = clean.indexOf("[");
+  const end = clean.lastIndexOf("]");
+  const slice = start !== -1 && end !== -1 ? clean.slice(start, end + 1) : clean;
+  return JSON.parse(slice);
+}
+
+function fmt(sec) {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+export default function ExamDrill() {
+  const [screen, setScreen] = useState("setup"); // setup | exam | grading | results
+  const [notes, setNotes] = useState("");
+  const [count, setCount] = useState(5);
+  const [mode, setMode] = useState("mcq"); // mcq | conceptual | mixed
+  const [timed, setTimed] = useState(true);
+  const [minutes, setMinutes] = useState(8);
+  const [error, setError] = useState("");
+
+  const [questions, setQuestions] = useState([]);
+  const [answers, setAnswers] = useState({});
+  const [current, setCurrent] = useState(0);
+  const [remaining, setRemaining] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
+  const [results, setResults] = useState(null);
+  const [loadIdx, setLoadIdx] = useState(0);
+  const [open, setOpen] = useState(null);
+
+  const tickRef = useRef(null);
+  const loadRef = useRef(null);
+
+  const busy = screen === "loading" || screen === "grading";
+
+  // rotating loading messages
+  useEffect(() => {
+    if (busy) {
+      setLoadIdx(0);
+      loadRef.current = setInterval(() => setLoadIdx((i) => i + 1), 1400);
+    } else if (loadRef.current) {
+      clearInterval(loadRef.current);
+    }
+    return () => loadRef.current && clearInterval(loadRef.current);
+  }, [busy]);
+
+  // exam timer
+  useEffect(() => {
+    if (screen !== "exam") return;
+    tickRef.current = setInterval(() => {
+      setElapsed((e) => e + 1);
+      if (timed) {
+        setRemaining((r) => {
+          if (r <= 1) {
+            clearInterval(tickRef.current);
+            finishExam();
+            return 0;
+          }
+          return r - 1;
+        });
+      }
+    }, 1000);
+    return () => clearInterval(tickRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen, timed]);
+
+  const suggested = Math.max(
+    3,
+    Math.round((count * (mode === "mcq" ? 60 : mode === "mixed" ? 105 : 150)) / 60)
+  );
+
+  async function generate() {
+    if (notes.trim().length < 40) {
+      setError("Paste a bit more of your notes — at least a few lines to work from.");
+      return;
+    }
+    setError("");
+    setScreen("loading");
+    const typeInstr =
+      mode === "mcq"
+        ? "All questions must be multiple choice with exactly 4 options."
+        : mode === "conceptual"
+        ? "All questions must be short-answer / conceptual (a derivation, definition, or explanation)."
+        : "Mix multiple-choice (4 options) and short-answer questions.";
+
+    const system = `You are an examiner writing an exam from a student's lecture notes. Write ${count} exam-style questions that test understanding, not recall of trivia. ${typeInstr} Favour the kind of question that appears on a university engineering/physics exam: applying a concept, reasoning about a limiting case, a short derivation, or interpreting a result. Keep everything concise so the whole paper is compact.
+
+Return ONLY a JSON array, no prose, no markdown fences. Each element:
+{
+  "type": "mcq" | "short",
+  "q": "the question text",
+  "options": ["A","B","C","D"],        // mcq only, exactly 4
+  "correct": 0,                         // mcq only, index of correct option
+  "keyPoints": ["point 1","point 2"],   // short only, 2-3 marking points
+  "explain": "one or two sentence explanation of the right answer"
+}`;
+
+    try {
+      const raw = await callClaude(system, "Notes:\n\n" + notes.trim());
+      const parsed = parseJSON(raw);
+      if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("empty");
+      setQuestions(parsed);
+      setAnswers({});
+      setCurrent(0);
+      setElapsed(0);
+      setRemaining(timed ? minutes * 60 : 0);
+      setScreen("exam");
+    } catch (e) {
+      setError("Couldn't build the paper from that. Try again, or trim the notes to one topic.");
+      setScreen("setup");
+    }
+  }
+
+  async function finishExam() {
+    clearInterval(tickRef.current);
+    setScreen("grading");
+
+    const shorts = questions
+      .map((q, i) => ({ q, i }))
+      .filter((x) => x.q.type === "short");
+
+    let shortGrades = {};
+    if (shorts.length) {
+      const system = `You are grading short exam answers. For each item you get the question, the marking points, and the student's answer. Award a mark from 0 to 1 (0.5 for partial). Be fair but exacting, as an exam grader would. Return ONLY a JSON array, one object per item in order: {"id": <the id>, "score": 0..1, "note": "one short line of feedback"}.`;
+      const payload = shorts
+        .map(
+          (x) =>
+            `id ${x.i} | Q: ${x.q.q} | key points: ${(x.q.keyPoints || []).join("; ")} | student answer: ${
+              (answers[x.i] || "").trim() || "(blank)"
+            }`
+        )
+        .join("\n");
+      try {
+        const raw = await callClaude(system, payload);
+        parseJSON(raw).forEach((g) => (shortGrades[g.id] = g));
+      } catch (e) {
+        // fall back to unscored if grading fails
+      }
+    }
+
+    let earned = 0;
+    const detail = questions.map((q, i) => {
+      if (q.type === "mcq") {
+        const got = answers[i];
+        const right = got === q.correct;
+        if (right) earned += 1;
+        return { i, correct: right ? 1 : 0, note: "" };
+      }
+      const g = shortGrades[i];
+      const sc = g ? g.score : null;
+      if (sc != null) earned += sc;
+      return { i, correct: sc, note: g ? g.note : "Not graded — check against the key points." };
+    });
+
+    setResults({ earned, total: questions.length, detail, time: elapsed });
+    setScreen("results");
+  }
+
+  function reset(keepQuestions) {
+    setError("");
+    if (keepQuestions) {
+      setAnswers({});
+      setCurrent(0);
+      setElapsed(0);
+      setRemaining(timed ? minutes * 60 : 0);
+      setResults(null);
+      setScreen("exam");
+    } else {
+      setResults(null);
+      setScreen("setup");
+    }
+  }
+
+  const timerColor =
+    timed && remaining <= 15 ? C.red : timed && remaining <= 45 ? C.amber : C.pen;
+
+  // ── shared page shell ──────────────────────────────────────────────
+  const shell = {
+    minHeight: "100%",
+    background: C.paper,
+    backgroundImage: `linear-gradient(${C.gridLine} 1px, transparent 1px), linear-gradient(90deg, ${C.gridLine} 1px, transparent 1px)`,
+    backgroundSize: "26px 26px",
+    color: C.ink,
+    fontFamily: SANS,
+    padding: "clamp(16px, 4vw, 40px)",
+    boxSizing: "border-box",
+  };
+  const card = {
+    maxWidth: 720,
+    margin: "0 auto",
+    background: C.panel,
+    border: `1px solid ${C.rule}`,
+    borderRadius: 4,
+    boxShadow: "0 1px 0 rgba(23,36,43,0.04)",
+  };
+
+  return (
+    <div style={shell}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz@0,6..72;1,6..72&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+        * { box-sizing: border-box; }
+        .ed-btn:focus-visible, .ed-in:focus-visible, .ed-opt:focus-visible { outline: 2px solid ${C.pen}; outline-offset: 2px; }
+        .ed-opt:hover { border-color: ${C.penSoft}; }
+        textarea.ed-in { resize: vertical; }
+      `}</style>
+
+      {/* masthead */}
+      <div style={{ maxWidth: 720, margin: "0 auto 18px", display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
+        <div>
+          <div style={{ fontFamily: SERIF, fontSize: 26, fontWeight: 600, letterSpacing: "-0.01em" }}>
+            The Drill
+          </div>
+          <div style={{ fontFamily: MONO, fontSize: 11, color: C.inkSoft, marginTop: 2 }}>
+            paste notes · sit the paper · get marked
+          </div>
+        </div>
+      </div>
+
+      {/* ── SETUP ─────────────────────────────────────────────── */}
+      {screen === "setup" && (
+        <div style={card}>
+          <div style={{ padding: "clamp(18px,4vw,30px)" }}>
+            <label style={{ fontFamily: MONO, fontSize: 12, color: C.inkSoft, display: "block", marginBottom: 8 }}>
+              Your lecture notes
+            </label>
+            <textarea
+              className="ed-in"
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="Paste a topic's worth of notes — a section of your running notes, a slide's worth of theory, a derivation…"
+              style={{
+                width: "100%",
+                minHeight: 170,
+                padding: 14,
+                border: `1px solid ${C.rule}`,
+                borderRadius: 4,
+                fontFamily: SERIF,
+                fontSize: 16,
+                lineHeight: 1.5,
+                color: C.ink,
+                background: "#FCFCFA",
+              }}
+            />
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18, marginTop: 22 }}>
+              <Field label="Questions">
+                <Segmented value={count} setValue={setCount} options={[3, 5, 8]} />
+              </Field>
+              <Field label="Type">
+                <Segmented
+                  value={mode}
+                  setValue={setMode}
+                  options={[["mcq", "MCQ"], ["conceptual", "Conceptual"], ["mixed", "Mixed"]]}
+                />
+              </Field>
+            </div>
+
+            <div style={{ marginTop: 22, display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+              <button
+                className="ed-btn"
+                onClick={() => setTimed((t) => !t)}
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 12,
+                  padding: "8px 12px",
+                  borderRadius: 4,
+                  cursor: "pointer",
+                  border: `1px solid ${timed ? C.pen : C.rule}`,
+                  background: timed ? C.pen : "#fff",
+                  color: timed ? "#fff" : C.inkSoft,
+                }}
+              >
+                {timed ? "✓ Timed exam" : "Untimed"}
+              </button>
+              {timed && (
+                <div style={{ display: "flex", alignItems: "center", gap: 8, fontFamily: MONO, fontSize: 12, color: C.inkSoft }}>
+                  <input
+                    className="ed-in"
+                    type="number"
+                    min={1}
+                    max={60}
+                    value={minutes}
+                    onChange={(e) => setMinutes(Math.max(1, Math.min(60, +e.target.value || 1)))}
+                    style={{ width: 56, padding: "6px 8px", border: `1px solid ${C.rule}`, borderRadius: 4, fontFamily: MONO, textAlign: "center" }}
+                  />
+                  min · suggested {suggested}
+                </div>
+              )}
+            </div>
+
+            {error && (
+              <div style={{ marginTop: 16, color: C.red, fontSize: 13, fontFamily: SANS }}>{error}</div>
+            )}
+
+            <button
+              className="ed-btn"
+              onClick={generate}
+              style={{
+                marginTop: 24,
+                width: "100%",
+                padding: "14px",
+                border: "none",
+                borderRadius: 4,
+                background: C.pen,
+                color: "#fff",
+                fontFamily: MONO,
+                fontSize: 14,
+                fontWeight: 500,
+                cursor: "pointer",
+                letterSpacing: "0.02em",
+              }}
+            >
+              Generate the paper
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── LOADING / GRADING ─────────────────────────────────── */}
+      {(screen === "loading" || screen === "grading") && (
+        <div style={{ ...card, padding: "48px 30px", textAlign: "center" }}>
+          <div style={{ fontFamily: MONO, fontSize: 13, color: C.pen }}>
+            {(screen === "loading" ? LOADING_LINES : GRADING_LINES)[
+              loadIdx % (screen === "loading" ? LOADING_LINES : GRADING_LINES).length
+            ]}
+            <span style={{ opacity: 0.5 }}>…</span>
+          </div>
+        </div>
+      )}
+
+      {/* ── EXAM ──────────────────────────────────────────────── */}
+      {screen === "exam" && questions[current] && (
+        <div style={card}>
+          {/* instrument header */}
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              padding: "14px 20px",
+              borderBottom: `1px solid ${C.rule}`,
+            }}
+          >
+            <div style={{ fontFamily: MONO, fontSize: 12, color: C.inkSoft }}>
+              Question {current + 1} / {questions.length}
+            </div>
+            <div
+              style={{
+                fontFamily: MONO,
+                fontVariantNumeric: "tabular-nums",
+                fontSize: 22,
+                fontWeight: 600,
+                color: timerColor,
+                letterSpacing: "0.04em",
+              }}
+            >
+              {timed ? fmt(remaining) : fmt(elapsed)}
+            </div>
+          </div>
+
+          {/* progress rule */}
+          <div style={{ height: 3, background: C.gridLine }}>
+            <div
+              style={{
+                height: "100%",
+                width: `${((current + 1) / questions.length) * 100}%`,
+                background: C.pen,
+                transition: "width .2s ease",
+              }}
+            />
+          </div>
+
+          <div style={{ padding: "clamp(20px,4vw,32px)" }}>
+            <div style={{ fontFamily: SERIF, fontSize: 20, lineHeight: 1.45, marginBottom: 22 }}>
+              {questions[current].q}
+            </div>
+
+            {questions[current].type === "mcq" ? (
+              <div style={{ display: "grid", gap: 10 }}>
+                {questions[current].options.map((opt, oi) => {
+                  const chosen = answers[current] === oi;
+                  return (
+                    <button
+                      key={oi}
+                      className="ed-opt ed-btn"
+                      onClick={() => setAnswers((a) => ({ ...a, [current]: oi }))}
+                      style={{
+                        textAlign: "left",
+                        display: "flex",
+                        gap: 12,
+                        alignItems: "flex-start",
+                        padding: "12px 14px",
+                        border: `1px solid ${chosen ? C.pen : C.rule}`,
+                        background: chosen ? "#F2F6FC" : "#fff",
+                        borderRadius: 4,
+                        cursor: "pointer",
+                        fontFamily: SERIF,
+                        fontSize: 16,
+                        color: C.ink,
+                      }}
+                    >
+                      <span style={{ fontFamily: MONO, fontSize: 13, color: chosen ? C.pen : C.inkSoft, paddingTop: 1 }}>
+                        {String.fromCharCode(65 + oi)}
+                      </span>
+                      <span>{opt}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <textarea
+                className="ed-in"
+                value={answers[current] || ""}
+                onChange={(e) => setAnswers((a) => ({ ...a, [current]: e.target.value }))}
+                placeholder="Write your answer…"
+                style={{
+                  width: "100%",
+                  minHeight: 130,
+                  padding: 14,
+                  border: `1px solid ${C.rule}`,
+                  borderRadius: 4,
+                  fontFamily: SERIF,
+                  fontSize: 16,
+                  lineHeight: 1.5,
+                  background: "#FCFCFA",
+                }}
+              />
+            )}
+
+            {/* nav */}
+            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 26 }}>
+              <button
+                className="ed-btn"
+                onClick={() => setCurrent((c) => Math.max(0, c - 1))}
+                disabled={current === 0}
+                style={{
+                  padding: "10px 16px",
+                  border: `1px solid ${C.rule}`,
+                  background: "#fff",
+                  borderRadius: 4,
+                  fontFamily: MONO,
+                  fontSize: 13,
+                  color: current === 0 ? C.rule : C.inkSoft,
+                  cursor: current === 0 ? "default" : "pointer",
+                }}
+              >
+                ← Back
+              </button>
+              {current < questions.length - 1 ? (
+                <button
+                  className="ed-btn"
+                  onClick={() => setCurrent((c) => c + 1)}
+                  style={{
+                    padding: "10px 18px",
+                    border: `1px solid ${C.pen}`,
+                    background: "#fff",
+                    color: C.pen,
+                    borderRadius: 4,
+                    fontFamily: MONO,
+                    fontSize: 13,
+                    cursor: "pointer",
+                  }}
+                >
+                  Next →
+                </button>
+              ) : (
+                <button
+                  className="ed-btn"
+                  onClick={finishExam}
+                  style={{
+                    padding: "10px 20px",
+                    border: "none",
+                    background: C.pen,
+                    color: "#fff",
+                    borderRadius: 4,
+                    fontFamily: MONO,
+                    fontSize: 13,
+                    fontWeight: 500,
+                    cursor: "pointer",
+                  }}
+                >
+                  Submit exam
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── RESULTS ───────────────────────────────────────────── */}
+      {screen === "results" && results && (
+        <div style={card}>
+          <div style={{ padding: "clamp(22px,4vw,34px)", borderBottom: `1px solid ${C.rule}` }}>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 14, flexWrap: "wrap" }}>
+              <div style={{ fontFamily: SERIF, fontSize: 46, fontWeight: 600, color: C.ink, lineHeight: 1 }}>
+                {Math.round((results.earned / results.total) * 100)}
+                <span style={{ fontSize: 22, color: C.inkSoft }}>%</span>
+              </div>
+              <div style={{ fontFamily: MONO, fontSize: 13, color: C.inkSoft }}>
+                {results.earned.toFixed(1)} / {results.total} marks · sat in {fmt(results.time)}
+              </div>
+            </div>
+          </div>
+
+          <div style={{ padding: "clamp(16px,4vw,28px)" }}>
+            {questions.map((q, i) => {
+              const d = results.detail[i];
+              const score = d.correct;
+              const bad = score === 0;
+              const partial = score != null && score > 0 && score < 1;
+              const bar = bad ? C.red : partial ? C.amber : C.green;
+              const isOpen = open === i;
+              return (
+                <div key={i} style={{ borderBottom: `1px solid ${C.gridLine}`, padding: "12px 0" }}>
+                  <button
+                    className="ed-btn"
+                    onClick={() => setOpen(isOpen ? null : i)}
+                    style={{
+                      width: "100%",
+                      display: "flex",
+                      gap: 12,
+                      alignItems: "flex-start",
+                      background: "none",
+                      border: "none",
+                      cursor: "pointer",
+                      textAlign: "left",
+                      padding: 0,
+                    }}
+                  >
+                    <span style={{ width: 4, alignSelf: "stretch", background: bar, borderRadius: 2, minHeight: 20 }} />
+                    <span style={{ fontFamily: MONO, fontSize: 12, color: C.inkSoft, paddingTop: 2, minWidth: 26 }}>
+                      Q{i + 1}
+                    </span>
+                    <span style={{ fontFamily: SERIF, fontSize: 16, color: C.ink, flex: 1 }}>{q.q}</span>
+                    <span style={{ fontFamily: MONO, fontSize: 12, color: bar, paddingTop: 2 }}>
+                      {score == null ? "—" : score === 1 ? "✓" : score === 0 ? "✗" : score.toFixed(1)}
+                    </span>
+                  </button>
+
+                  {isOpen && (
+                    <div style={{ paddingLeft: 42, paddingTop: 12, fontSize: 14, lineHeight: 1.55, color: C.inkSoft }}>
+                      {q.type === "mcq" ? (
+                        <>
+                          <div style={{ marginBottom: 6 }}>
+                            <span style={{ color: C.inkSoft }}>Your answer: </span>
+                            <span style={{ color: answers[i] === q.correct ? C.green : C.red, fontWeight: 500 }}>
+                              {answers[i] != null ? `${String.fromCharCode(65 + answers[i])}. ${q.options[answers[i]]}` : "(blank)"}
+                            </span>
+                          </div>
+                          <div style={{ marginBottom: 8 }}>
+                            <span style={{ color: C.inkSoft }}>Correct: </span>
+                            <span style={{ color: C.green, fontWeight: 500 }}>
+                              {String.fromCharCode(65 + q.correct)}. {q.options[q.correct]}
+                            </span>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div style={{ marginBottom: 8 }}>
+                            <span style={{ color: C.inkSoft }}>Your answer: </span>
+                            <span style={{ fontFamily: SERIF, color: C.ink }}>{(answers[i] || "").trim() || "(blank)"}</span>
+                          </div>
+                          {q.keyPoints && (
+                            <div style={{ marginBottom: 8 }}>
+                              <span style={{ color: C.inkSoft }}>Key points: </span>
+                              {q.keyPoints.join(" · ")}
+                            </div>
+                          )}
+                          {d.note && (
+                            <div style={{ marginBottom: 8, color: C.pen }}>Grader: {d.note}</div>
+                          )}
+                        </>
+                      )}
+                      <div style={{ fontStyle: "italic", color: C.ink }}>{q.explain}</div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            <div style={{ display: "flex", gap: 12, marginTop: 22, flexWrap: "wrap" }}>
+              <button
+                className="ed-btn"
+                onClick={() => reset(true)}
+                style={{
+                  padding: "11px 18px",
+                  border: `1px solid ${C.pen}`,
+                  background: "#fff",
+                  color: C.pen,
+                  borderRadius: 4,
+                  fontFamily: MONO,
+                  fontSize: 13,
+                  cursor: "pointer",
+                }}
+              >
+                Retake this paper
+              </button>
+              <button
+                className="ed-btn"
+                onClick={() => reset(false)}
+                style={{
+                  padding: "11px 18px",
+                  border: "none",
+                  background: C.pen,
+                  color: "#fff",
+                  borderRadius: 4,
+                  fontFamily: MONO,
+                  fontSize: 13,
+                  cursor: "pointer",
+                }}
+              >
+                New paper
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <div>
+      <div style={{ fontFamily: MONO, fontSize: 12, color: C.inkSoft, marginBottom: 8 }}>{label}</div>
+      {children}
+    </div>
+  );
+}
+
+function Segmented({ value, setValue, options }) {
+  return (
+    <div style={{ display: "inline-flex", border: `1px solid ${C.rule}`, borderRadius: 4, overflow: "hidden" }}>
+      {options.map((o, idx) => {
+        const val = Array.isArray(o) ? o[0] : o;
+        const lbl = Array.isArray(o) ? o[1] : o;
+        const on = value === val;
+        return (
+          <button
+            key={val}
+            className="ed-btn"
+            onClick={() => setValue(val)}
+            style={{
+              padding: "8px 14px",
+              border: "none",
+              borderLeft: idx === 0 ? "none" : `1px solid ${C.rule}`,
+              background: on ? C.pen : "#fff",
+              color: on ? "#fff" : C.inkSoft,
+              fontFamily: MONO,
+              fontSize: 13,
+              cursor: "pointer",
+            }}
+          >
+            {lbl}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
